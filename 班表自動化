@@ -1,0 +1,131 @@
+import streamlit as st
+import pandas as pd
+from openpyxl import load_workbook
+from io import BytesIO
+import datetime
+
+st.set_page_config(page_title="班表任務自動化", layout="wide")
+st.title("班表任務自動化系統")
+
+# 上傳 Excel
+uploaded_file = st.file_uploader("上傳 Excel 檔案 (.xlsx)", type=["xlsx"])
+
+if uploaded_file:
+    xls = pd.ExcelFile(uploaded_file)
+    sheet_name_總表 = st.selectbox("選擇總表工作表", xls.sheet_names)
+    sheet_name_員工 = st.selectbox("選擇員工資料表", xls.sheet_names)
+
+    if st.button("執行全部班表任務"):
+        # 讀取總表與員工表
+        df總表 = pd.read_excel(uploaded_file, sheet_name=sheet_name_總表)
+        df員工 = pd.read_excel(uploaded_file, sheet_name=sheet_name_員工)
+
+        # === 模組 1: 解合併並填入原值 ===
+        # Streamlit 無法直接操作 merged cell，因此用 pandas 已經展開的資料
+        # 若使用 openpyxl 處理 merged cell，可擴充此部分
+
+        # === 模組 2: 彙整排班資料 ===
+        output_rows = []
+        clinicName = str(df總表.iloc[0,0])[:4]
+
+        for c in range(1, df總表.shape[1]):
+            for r in range(df總表.shape[0]):
+                if isinstance(df總表.iat[r, c], (datetime.datetime, pd.Timestamp)):
+                    dateValue = df總表.iat[r, c]
+                    i = r + 3
+                    while i < df總表.shape[0]:
+                        shiftType = str(df總表.iat[i, c]).strip()
+                        if isinstance(df總表.iat[i, c], (datetime.datetime, pd.Timestamp)) or shiftType == "":
+                            break
+                        if shiftType in ["早","午","晚"]:
+                            i += 1
+                            while i < df總表.shape[0]:
+                                if isinstance(df總表.iat[i, c], (datetime.datetime, pd.Timestamp)):
+                                    break
+                                cellValue = str(df總表.iat[i, c]).strip()
+                                if cellValue in ["早","午","晚"]:
+                                    break
+                                output_rows.append([
+                                    clinicName,
+                                    dateValue.strftime("%Y/%m/%d"),
+                                    shiftType,
+                                    cellValue,
+                                    df總表.iat[i, 0],
+                                    df總表.iat[i, 20] if df總表.shape[1]>20 else ""
+                                ])
+                                i += 1
+                            i -= 1
+                        i += 1
+
+        df彙整結果 = pd.DataFrame(output_rows, columns=["診所","日期","班別","姓名","A欄資料","U欄資料"])
+
+        # === 模組 3: 建立班別分析表 ===
+        emp_dict = {}
+        for _, row in df員工.iterrows():
+            name = str(row[1]).strip()
+            if name:
+                emp_dict[name] = [str(row[0]), row[2], row[3]]
+
+        shift_dict = {}
+        for _, row in df彙整結果.iterrows():
+            key = f"{row['姓名']}|{row['日期']}|{row['診所']}|{row['A欄資料']}"
+            shift_dict[key] = shift_dict.get(key, "") + " " + row['班別'] if key in shift_dict else row['班別']
+
+        def FormatShiftOrder(shiftStr):
+            result = ""
+            if "早" in shiftStr: result += "早"
+            if "午" in shiftStr: result += "午"
+            if "晚" in shiftStr: result += "晚"
+            return result
+
+        def GetClassCode(empTitle, clinicName, shiftType):
+            if not empTitle:
+                return ""
+            classCode = ""
+            if empTitle in ["早班護理師","早班內視鏡助理","醫務專員","兼職早班內視鏡助理"]:
+                return "【員工】純早班"
+            if empTitle=="醫師": classCode="★醫師★"
+            elif empTitle in ["櫃臺","護理師","兼職護理師","兼職跟診助理","副店長"]: classCode="【員工】"
+            elif "副店長" in empTitle: classCode="【員工】"
+            elif "店長" in empTitle or "護士" in empTitle: classCode="◇主管◇"
+
+            if shiftType!="早":
+                if clinicName in ["上吉診所","立吉診所","上承診所","立全診所","立竹診所","立順診所","上京診所"]:
+                    classCode += "板土中京"
+                elif clinicName=="立丞診所":
+                    classCode += "立丞"
+            mapping = {"早":"早班","午晚":"午晚班","早午晚":"全天班","早晚":"早晚班","午":"午班","晚":"晚班","早午":"早午班"}
+            classCode += mapping.get(shiftType,"")
+            if classCode.endswith("早班早班"):
+                classCode = classCode.replace("早班早班","早班")
+            return classCode
+
+        analysis_rows = []
+        for key, val in shift_dict.items():
+            name, dateValue, clinicName, eValue = key.split("|")
+            shiftType = FormatShiftOrder(val)
+            empID, empDept, empTitle = emp_dict.get(name, ["","",""])
+            analysis_rows.append([clinicName, empID, empDept, name, empTitle, dateValue, shiftType, eValue, GetClassCode(empTitle, clinicName, shiftType)])
+        df班別分析 = pd.DataFrame(analysis_rows, columns=["診所","員工編號","所屬部門","姓名","職稱","日期","班別","E欄資料","班別代碼"])
+
+        # === 模組 4: 建立班別總表 ===
+        allDates = pd.date_range(start="2025-08-01", end="2025-08-31")
+        total_rows = []
+        for empID_name, group in df班別分析.groupby(["員工編號","姓名"]):
+            row = {"員工編號": empID_name[0], "員工姓名": empID_name[1]}
+            for d in allDates:
+                match = group[group["日期"]==d.strftime("%Y/%m/%d")]
+                row[d.strftime("%Y-%m-%d")] = match["班別代碼"].values[0] if not match.empty else ""
+            total_rows.append(row)
+        df班別總表 = pd.DataFrame(total_rows)
+
+        # === 生成 Excel 給使用者下載 ===
+        output = BytesIO()
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            df彙整結果.to_excel(writer, index=False, sheet_name="彙整結果")
+            df班別分析.to_excel(writer, index=False, sheet_name="班別分析")
+            df班別總表.to_excel(writer, index=False, sheet_name="班別總表")
+        output.seek(0)
+
+        st.success("所有班表任務已完成！")
+        st.download_button("下載結果 Excel", data=output, file_name="班表結果.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
